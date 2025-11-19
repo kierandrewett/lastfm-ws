@@ -56,12 +56,16 @@ impl LastFmClient {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        let album_art = track["image"]
+        let mut album_art = track["image"]
             .as_array()
             .and_then(|imgs| imgs.last())
             .and_then(|img| img["#text"].as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+
+        if album_art.as_ref().map(|s| s.contains("2a96cbd8b46e442fc41c2b86b821562f")).unwrap_or(false) {
+            album_art = None;
+        }
 
         Ok(Some(NowPlaying {
             artist,
