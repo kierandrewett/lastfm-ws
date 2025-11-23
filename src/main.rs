@@ -2,7 +2,8 @@ mod bus;
 mod lastfm;
 mod model;
 mod poller;
-mod redis;
+
+use std::sync::Arc;
 
 use actix::*;
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, get, web};
@@ -11,17 +12,23 @@ use actix_web_actors::ws;
 use bus::NowPlayingBus;
 use lastfm::LastFmClient;
 use poller::run_poller;
-use redis::RedisStore;
+use tokio::sync::RwLock;
+
+use crate::model::{NowPlaying, PlaybackState};
 
 #[derive(Clone)]
 struct AppState {
     bus: NowPlayingBus,
-    redis: RedisStore,
+    pub now_playing: Arc<RwLock<Option<NowPlaying>>>,
+    pub last_playing: Arc<RwLock<Option<NowPlaying>>>,
+    pub track_started_at: Arc<RwLock<Option<std::time::Instant>>>,
+    pub last_position_ms: Arc<RwLock<u64>>,
+    pub playback_state: Arc<RwLock<PlaybackState>>,
 }
 
 struct WsConn {
     rx: tokio::sync::broadcast::Receiver<model::NowPlaying>,
-    redis: RedisStore,
+    state: Arc<AppState>,
 }
 
 #[derive(Message)]
@@ -34,16 +41,14 @@ impl Actor for WsConn {
     fn started(&mut self, ctx: &mut Self::Context) {
         // send cached instantly
         {
-            let redis = self.redis.clone();
             let addr = ctx.address();
+            let state = self.state.clone();
 
             actix::spawn(async move {
-                if let Ok(Some(cached)) = redis.get_now_playing().await {
-                    if cached.now_playing {
-                        let msg = serde_json::to_string(&cached).unwrap();
-                        addr.do_send(SendText(msg));
-                    }
-                }
+                state.now_playing.read().await.clone().map(|np| {
+                    let msg = serde_json::to_string(&np).unwrap();
+                    addr.do_send(SendText(msg));
+                });
             });
         }
 
@@ -72,17 +77,43 @@ impl Actor for WsConn {
         }
 
         {
-            let redis = self.redis.clone();
             let addr = ctx.address();
+            let state = self.state.clone();
 
             actix::spawn(async move {
                 loop {
-                    let is_playing = redis.get_now_playing().await
-                        .map(|opt| opt.is_some())
-                        .unwrap_or(false);
+                    let playback_state = *state.playback_state.read().await;
+                    let playing_state = state.now_playing.read().await.clone();
+                    let prev_playing_state = state.last_playing.read().await.clone();
+                    let started_at = state.track_started_at.read().await.clone();
+                    let frozen_pos = *state.last_position_ms.read().await;
+
+                    let position_ms =
+                        if let Some(start) = started_at {
+                            if matches!(playback_state, PlaybackState::Playing) {
+                                start.elapsed().as_millis() as u64
+                            } else {
+                                frozen_pos
+                            }
+                        } else {
+                            frozen_pos
+                        };
+
+                    let duration_ms = playing_state
+                        .clone()
+                        .or_else(|| prev_playing_state)
+                        .as_ref()
+                        .and_then(|np| {
+                            np.track_info
+                                .as_ref()
+                                .and_then(|t| t.duration.parse::<u64>().ok())
+                        })
+                        .unwrap_or(0);
 
                     let msg = serde_json::json!({
-                        "playing": is_playing
+                        "playing": matches!(playback_state, PlaybackState::Playing),
+                        "position_ms": position_ms.min(duration_ms),
+                        "duration_ms": duration_ms.max(0),
                     })
                     .to_string();
 
@@ -118,7 +149,7 @@ async fn ws_route(
     ws::start(
         WsConn {
             rx,
-            redis: data.redis.clone(),
+            state: data.get_ref().clone().into(),
         },
         &req,
         stream,
@@ -134,20 +165,17 @@ async fn main() -> std::io::Result<()> {
     let api_key = std::env::var("LASTFM_API_KEY").expect("LASTFM_API_KEY not set");
     let user = std::env::var("LASTFM_USER").expect("LASTFM_USER not set");
 
-    let redis_url = std::env::var("REDIS_URL").unwrap_or("redis://127.0.0.1/".into());
-    let redis = RedisStore::new(&redis_url);
-
-    redis.clear_now_playing().await.unwrap();
-
     let bus = NowPlayingBus::new();
 
-    tokio::spawn(run_poller(
-        LastFmClient::new(api_key, user),
-        bus.clone(),
-        redis.clone(),
-    ));
-
-    let state = AppState { bus, redis };
+    let state = AppState {
+        bus,
+        now_playing: Arc::new(RwLock::new(None)),
+        last_playing: Arc::new(RwLock::new(None)),
+        track_started_at: Arc::new(RwLock::new(None)),
+        last_position_ms: Arc::new(RwLock::new(0)),
+        playback_state: Arc::new(RwLock::new(PlaybackState::Stopped)),
+    };
+    tokio::spawn(run_poller(LastFmClient::new(api_key, user), state.clone()));
 
     HttpServer::new(move || {
         App::new()

@@ -14,9 +14,12 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-redis = { version = "0.25", features = ["tokio-comp"] }
 
 anyhow = "1"
 dotenvy = "0.15"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
+sha2 = "0.10.9"
+sha1 = "0.10.6"
+current = "1.0.1"
+deadpool-redis = "0.22.0"
