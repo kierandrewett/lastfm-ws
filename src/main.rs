@@ -45,6 +45,10 @@ impl Actor for WsConn {
             let state = self.state.clone();
 
             actix::spawn(async move {
+                if state.playback_state.read().await.clone() != PlaybackState::Playing {
+                    return;
+                }
+                
                 state.now_playing.read().await.clone().map(|np| {
                     let msg = serde_json::to_string(&np).unwrap();
                     addr.do_send(SendText(msg));
